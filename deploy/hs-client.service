@@ -1,0 +1,20 @@
+[Unit]
+Description=hs-poc Mesh Client (WireGuard netstack)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment="HOME=/home/ubuntu"
+ExecStart=/home/ubuntu/hs-client up \
+  --server http://43.165.166.56:8080 \
+  --port 51832
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

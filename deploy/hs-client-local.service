@@ -1,0 +1,22 @@
+[Unit]
+Description=hs-poc Mesh Client (WireGuard netstack) - Local
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hermes-agent/hs-poc/client
+Environment="HOME=/root"
+ExecStart=/opt/hermes-agent/hs-poc/client/hs-client up \
+  --server http://43.165.166.56:8080 \
+  --port 51823 \
+  --peer-endpoint=100.64.0.26=43.165.166.56:51832 \
+  --peer-endpoint=100.64.0.32=192.192.20.86:51822
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

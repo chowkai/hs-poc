@@ -16,7 +16,7 @@ adb install app-release.apk
 
 - 腾讯云 Headscale 已运行：`curl http://43.165.166.56:8080/health` → `{"status":"ok"}`
 - 手机有网络（WiFi 或 4G/5G）
-- **首次启动会弹 VPN 授权框，必须点"允许"**（当前仍走 VpnService 模式）
+- **无需 VPN 权限弹窗**（纯用户态 netstack）
 
 ### 3. 测试步骤
 

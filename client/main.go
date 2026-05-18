@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -48,7 +49,7 @@ func init() {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: hs-client <register|up|down|status|ping> [args...]")
+		fmt.Fprintln(os.Stderr, "usage: hs-client <register|up|down|status|ping|traceroute|serve> [args...]")
 		os.Exit(1)
 	}
 	switch os.Args[1] {
@@ -62,6 +63,10 @@ func main() {
 		cmdStatus(os.Args[2:])
 	case "ping":
 		cmdPing(os.Args[2:])
+	case "traceroute":
+		cmdTraceroute(os.Args[2:])
+	case "serve":
+		cmdServe(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		os.Exit(1)
@@ -719,5 +724,148 @@ func cmdPing(args []string) {
 
 		fmt.Printf("reply from %s: seq=%d time=%v\n", target, echo.Seq, time.Since(start))
 		time.Sleep(time.Second)
+	}
+}
+
+// --- Traceroute ---
+
+func cmdTraceroute(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: hs-client traceroute <ip>")
+		os.Exit(1)
+	}
+	target := args[0]
+
+	if tnet == nil {
+		// Not running with netstack — fall back to kernel traceroute
+		cmd := exec.Command("traceroute", "-m", "30", "-w", "2", target)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "traceroute failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	fmt.Printf("traceroute to %s, 30 hops max\n", target)
+
+	for ttl := 1; ttl <= 30; ttl++ {
+		socket, err := tnet.Dial("ping4", target)
+		if err != nil {
+			fmt.Printf("%2d  *\n", ttl)
+			continue
+		}
+
+		pc := ipv4.NewConn(socket)
+		if err := pc.SetTTL(ttl); err != nil {
+			socket.Close()
+			fmt.Printf("%2d  *\n", ttl)
+			continue
+		}
+
+		// Build ICMP Echo request
+		icmpMsg := icmp.Message{
+			Type: ipv4.ICMPTypeEcho,
+			Code: 0,
+			Body: &icmp.Echo{
+				ID:   os.Getpid() & 0xffff,
+				Seq:  ttl,
+				Data: []byte("hs-poc-trace"),
+			},
+		}
+		b, err := icmpMsg.Marshal(nil)
+		if err != nil {
+			socket.Close()
+			fmt.Printf("%2d  *\n", ttl)
+			continue
+		}
+
+		socket.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := socket.Write(b); err != nil {
+			socket.Close()
+			fmt.Printf("%2d  *\n", ttl)
+			continue
+		}
+
+		// Read response
+		rbuf := make([]byte, 1500)
+		socket.SetReadDeadline(time.Now().Add(3 * time.Second))
+		start := time.Now()
+		n, err := socket.Read(rbuf)
+		elapsed := time.Since(start)
+
+		if err != nil {
+			socket.Close()
+			fmt.Printf("%2d  *\n", ttl)
+			continue
+		}
+
+		// Try to parse IPv4 header for source address (netstack may include it)
+		hopIP := target
+		icmpStart := 0
+		if n > 20 && (rbuf[0]>>4) == 4 {
+			ihl := int(rbuf[0]&0x0f) * 4
+			if ihl >= 20 && n > ihl {
+				hopIP = fmt.Sprintf("%d.%d.%d.%d", rbuf[12], rbuf[13], rbuf[14], rbuf[15])
+				icmpStart = ihl
+			}
+		}
+
+		reply, err := icmp.ParseMessage(1, rbuf[icmpStart:n])
+		if err != nil {
+			socket.Close()
+			fmt.Printf("%2d  *\n", ttl)
+			continue
+		}
+
+		socket.Close()
+
+		switch reply.Type {
+		case ipv4.ICMPTypeEchoReply:
+			fmt.Printf("%2d  %s  %.3f ms\n", ttl, hopIP, float64(elapsed.Microseconds())/1000.0)
+			return
+		case ipv4.ICMPTypeTimeExceeded:
+			fmt.Printf("%2d  %s  %.3f ms\n", ttl, hopIP, float64(elapsed.Microseconds())/1000.0)
+		default:
+			fmt.Printf("%2d  %s  %.3f ms (type=%d)\n", ttl, hopIP, float64(elapsed.Microseconds())/1000.0, reply.Type)
+		}
+	}
+	fmt.Println("traceroute complete (max hops reached)")
+}
+
+// --- Serve ---
+
+func cmdServe(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: hs-client serve <port>")
+		os.Exit(1)
+	}
+	port := args[0]
+
+	if tnet == nil {
+		fmt.Fprintln(os.Stderr, "error: netstack not running. Run 'hs-client up' first.")
+		os.Exit(1)
+	}
+
+	var portNum int
+	if _, err := fmt.Sscanf(port, "%d", &portNum); err != nil || portNum < 1 || portNum > 65535 {
+		fmt.Fprintf(os.Stderr, "invalid port: %s\n", port)
+		os.Exit(1)
+	}
+
+	listener, err := tnet.ListenTCP(&net.TCPAddr{Port: portNum})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "listen on netstack port %s failed: %v\n", port, err)
+		os.Exit(1)
+	}
+
+	cwd, _ := os.Getwd()
+	fmt.Printf("Serving files from %s on port %s (netstack)\n", cwd, port)
+
+	handler := http.FileServer(http.Dir("."))
+	if err := http.Serve(listener, handler); err != nil {
+		fmt.Fprintf(os.Stderr, "HTTP serve error: %v\n", err)
+		os.Exit(1)
 	}
 }
