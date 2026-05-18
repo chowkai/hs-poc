@@ -3,13 +3,36 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-/// Headscale client service that manages the hs-client binary lifecycle.
+/// Headscale client service — 纯 hs-client 二进制驱动，零外部依赖。
 class HsService {
   static const String clientBin = 'hs-client';
-  static const _vpnChannel = MethodChannel('com.hspoc/vpn');
 
-  String serverUrl = 'http://127.0.0.1:18080';
-  String adminKey = 'poc-admin-key-change-me';
+  // 默认值（真机可用）
+  String serverUrl = 'http://43.165.166.56:8080';
+  String adminKey = 'hskey-api-F65eEHOQ-Rbz-XZZiYgZmXDgs4bPmR7QhL5zSWK3E7H1gqpC0SvLyo9gceSqRm25yowr-_lhpxPdY';
+
+  File? _androidBinary;
+  Process? _wgProcess;
+
+  // ── Android 二进制提取 ────────────────────────────────────────
+
+  /// 从 APK assets 提取 hs-client arm64 到可写目录，仅首次。
+  Future<File> _ensureAndroidBinary() async {
+    if (_androidBinary != null) return _androidBinary!;
+    final binFile = File('/data/data/com.example.hs_poc/files/hs-client');
+    if (!await binFile.exists()) {
+      final data = await rootBundle.load('assets/hs-client-android');
+      await binFile.writeAsBytes(data.buffer.asUint8List());
+      await Process.run('chmod', ['755', binFile.path]);
+    }
+    _androidBinary = binFile;
+    return binFile;
+  }
+
+  /// Android 的数据目录（HOME），hs-client 在这里存状态。
+  String get _androidHome => '/data/data/com.example.hs_poc/files';
+
+  // ── 平台路径 ──────────────────────────────────────────────────
 
   String get clientPath {
     if (Platform.isWindows) return 'assets/hs-client.exe';
@@ -18,117 +41,108 @@ class HsService {
     return 'assets/hs-client-linux';
   }
 
-  Future<String> _run(List<String> args) async {
-    final result = await Process.run(clientPath, args);
-    if (result.exitCode != 0) {
-      throw Exception('hs-client failed: ${result.stderr}');
-    }
-    return (result.stdout as String).trim();
-  }
+  // ── 注册 ──────────────────────────────────────────────────────
 
   Future<String> register({required String server, required String key, String? name}) async {
+    serverUrl = server;
+    adminKey = key;
+
     if (Platform.isAndroid) {
-      final httpClient = HttpClient();
-      try {
-        final uri = Uri.parse('$server/api/v1/node/register');
-        final request = await httpClient.postUrl(uri);
-        request.headers.set('Content-Type', 'application/json');
-        request.headers.set('Authorization', 'Bearer $key');
-        request.write(jsonEncode({'name': name ?? 'android-device'}));
-        final response = await request.close();
-        if (response.statusCode == 200) {
-          final body = await response.transform(utf8.decoder).join();
-          final data = jsonDecode(body);
-          return data['id'] ?? data['node_id'] ?? 'registered';
-        }
-        throw Exception('Registration failed: ${response.statusCode}');
-      } finally {
-        httpClient.close();
+      final bin = await _ensureAndroidBinary();
+      final args = ['register', '--server', server, '--key', key];
+      if (name != null) args.addAll(['--name', name]);
+
+      final result = await Process.run(bin.path, args, environment: {'HOME': _androidHome});
+      if (result.exitCode != 0) {
+        throw Exception('hs-client register failed: ${result.stderr}');
       }
+      return (result.stdout as String).trim();
     }
 
+    // 桌面端
     final args = ['register', '--server', server, '--key', key];
     if (name != null) args.addAll(['--name', name]);
-    final nodeId = await _run(args);
-    return nodeId;
+    return (await _run(args)).trim();
   }
 
-  Future<String> connect({
-    String? server,
-    String? key,
-    String? nodeId,
-    String? privateKey,
-    String? peerKey,
-    String? endpoint,
-    String? localIP,
-    String? peerIP,
-  }) async {
+  // ── 连接 (WG up) ─────────────────────────────────────────────
+
+  Future<String> connect() async {
     if (Platform.isAndroid) {
-      _vpnChannel.setMethodCallHandler((call) async {
-        // handle vpnStatusChanged invocations from native
-      });
-      final result = await _vpnChannel.invokeMethod<String>('startVpn', {
-        'privateKey': 'cIZUuc+tUujfZmeay6cRdQ++Ab7OLzKTWWLnQa+ZcFk=',
-        'peerKey': 'Di+wh0LxYyf/2KLT1wdVTDciF7mzN0qE1ZkAU904H1Y=',
-        'endpoint': '10.0.2.2:46378',
-        'localIP': '100.64.0.2',
-        'peerIP': '100.64.0.1',
-      });
-      return result ?? 'connecting';
+      final bin = await _ensureAndroidBinary();
+      final args = ['up', '--server', serverUrl, '--key', adminKey];
+
+      _wgProcess = await Process.start(bin.path, args, environment: {'HOME': _androidHome});
+      _wgProcess!.stdout.transform(utf8.decoder).listen((d) => debugPrint('hs-client: $d'));
+      _wgProcess!.stderr.transform(utf8.decoder).listen((d) => debugPrint('hs-client err: $d'));
+      return 'connecting';
     }
 
-    final args = ['up'];
-    if (server != null) args.addAll(['--server', server]);
-    if (key != null) args.addAll(['--key', key]);
-    if (nodeId != null) args.addAll(['--id', nodeId]);
-
-    final process = await Process.start(clientPath, args);
-    process.stdout.listen((data) {
-      debugPrint('hs-client: ${utf8.decode(data)}');
-    });
-    process.stderr.listen((data) {
-      debugPrint('hs-client err: ${utf8.decode(data)}');
-    });
+    // 桌面端
+    final args = ['up', '--server', serverUrl, '--key', adminKey];
+    _wgProcess = await Process.start(clientPath, args);
+    _wgProcess!.stdout.transform(utf8.decoder).listen((d) => debugPrint('hs-client: $d'));
+    _wgProcess!.stderr.transform(utf8.decoder).listen((d) => debugPrint('hs-client err: $d'));
     return 'connecting';
   }
 
+  // ── 断开 ──────────────────────────────────────────────────────
+
   Future<void> disconnect() async {
     if (Platform.isAndroid) {
-      await _vpnChannel.invokeMethod('stopVpn');
+      try {
+        final bin = await _ensureAndroidBinary();
+        await Process.run(bin.path, ['down'], environment: {'HOME': _androidHome});
+      } catch (_) {}
+      _wgProcess?.kill();
+      _wgProcess = null;
       return;
     }
-    await _run(['down']);
+
+    try {
+      await _run(['down']);
+    } catch (_) {}
+    _wgProcess?.kill();
+    _wgProcess = null;
   }
+
+  // ── 状态 ──────────────────────────────────────────────────────
 
   Future<HsStatus> status() async {
     if (Platform.isAndroid) {
       try {
-        final result = await _vpnChannel.invokeMethod<String>('status');
-        final connected = result == 'connected';
-        return HsStatus(connected: connected, ip: '', peers: []);
-      } catch (e) {
-        return HsStatus(connected: false, ip: '', peers: []);
-      }
+        final bin = await _ensureAndroidBinary();
+        final result = await Process.run(bin.path, ['status'], environment: {'HOME': _androidHome});
+        if (result.exitCode == 0) {
+          final json = jsonDecode(result.stdout as String) as Map<String, dynamic>;
+          return HsStatus.fromJson(json);
+        }
+      } catch (_) {}
+      return HsStatus(connected: false, ip: '', peers: []);
     }
 
     try {
       final output = await _run(['status']);
       final json = jsonDecode(output) as Map<String, dynamic>;
       return HsStatus.fromJson(json);
-    } catch (e) {
+    } catch (_) {
       return HsStatus(connected: false, ip: '', peers: []);
     }
   }
 
+  // ── Ping ──────────────────────────────────────────────────────
+
   Future<String> ping(String targetIP) async {
     if (Platform.isAndroid) {
       try {
-        final result = await Process.run('ping', ['-c', '3', targetIP]);
+        final bin = await _ensureAndroidBinary();
+        final result = await Process.run(bin.path, ['ping', targetIP], environment: {'HOME': _androidHome});
         return (result.stdout as String).trim();
       } catch (e) {
         return 'Ping failed: $e';
       }
     }
+
     try {
       final result = await Process.run(clientPath, ['ping', targetIP]);
       return (result.stdout as String).trim();
@@ -136,7 +150,19 @@ class HsService {
       return 'Ping failed: $e';
     }
   }
+
+  // ── 内部方法 ──────────────────────────────────────────────────
+
+  Future<String> _run(List<String> args) async {
+    final result = await Process.run(clientPath, args);
+    if (result.exitCode != 0) {
+      throw Exception('hs-client failed: ${result.stderr}');
+    }
+    return (result.stdout as String).trim();
+  }
 }
+
+// ── 数据模型 ────────────────────────────────────────────────────
 
 class HsStatus {
   final bool connected;

@@ -27,8 +27,8 @@ class _HomePageState extends State<HomePage> {
   bool _loading = false;
   String _statusText = '';
   final HsService _hsService = HsService();
-  final _serverCtrl = TextEditingController(text: 'http://10.0.2.2:9090');
-  final _keyCtrl = TextEditingController(text: 'hs-poc-test-20260515');
+  final _serverCtrl = TextEditingController(text: 'http://43.165.166.56:8080');
+  final _keyCtrl = TextEditingController(text: 'hskey-api-F65eEHOQ-Rbz-XZZiYgZmXDgs4bPmR7QhL5zSWK3E7H1gqpC0SvLyo9gceSqRm25yowr-_lhpxPdY');
 
   @override
   void dispose() { _serverCtrl.dispose(); _keyCtrl.dispose(); super.dispose(); }
@@ -59,11 +59,6 @@ class _HomePageState extends State<HomePage> {
       debugPrint('🔵 calling connect...');
       final status = await _hsService.connect();
       debugPrint('🟢 connect result: $status');
-      if (status == 'waiting_permission') {
-        debugPrint('🟡 VPN permission required — user must accept dialog');
-        if (mounted) setState(() { _loading = false; _statusText = 'VPN Permission Required'; });
-        return;
-      }
       if (mounted) setState(() { _loading = false; _connected = true; });
     } catch (e) {
       debugPrint('🔴 ERROR: $e');
