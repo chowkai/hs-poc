@@ -1,0 +1,534 @@
+package com.example.hs_poc
+
+import android.util.Log
+import com.example.hs_poc.WireGuardCrypto.toHex
+import java.util.Base64
+import kotlin.concurrent.Volatile
+
+/**
+ * WireGuard Noise_IKpsk2 handshake implementation.
+ *
+ * Implements both initiator and responder roles for the WireGuard handshake
+ * protocol as described in the WireGuard whitepaper.
+ *
+ * Message types:
+ *   1 = Handshake Initiation (148 bytes)
+ *   2 = Handshake Response   (92 bytes)
+ *   3 = Cookie Reply
+ *   4 = Transport Data
+ *
+ * Message layouts (all multi-byte integers are little-endian):
+ *
+ * Initiation (148 bytes):
+ *   [0..3]    type (LE32 = 1)
+ *   [4..7]    sender_index (LE32)
+ *   [8..39]   ephemeral (32 bytes)
+ *   [40..87]  enc_static (48 bytes = 32 plaintext + 16 Poly1305 tag)
+ *   [88..115] enc_timestamp (28 bytes = 12 plaintext + 16 tag)
+ *   [116..131] mac1 (16 bytes)
+ *   [132..147] mac2 (16 bytes)
+ *
+ * Response (92 bytes):
+ *   [0..3]    type (LE32 = 2)
+ *   [4..7]    sender_index (LE32)
+ *   [8..11]   receiver_index (LE32)
+ *   [12..43]  ephemeral (32 bytes)
+ *   [44..59]  enc_empty (16 bytes = 0 plaintext + 16 tag)
+ *   [60..75]  mac1 (16 bytes)
+ *   [76..91]  mac2 (16 bytes)
+ */
+class WireGuardNoise(
+    private val staticPrivateKey: ByteArray,
+    private val staticPublicKey: ByteArray,
+    private val peerStaticPublicKey: ByteArray,
+    private val psk: ByteArray = ByteArray(32)
+) {
+    companion object {
+        const val TAG = "WireGuardNoise"
+
+        const val MSG_INITIATION = 1
+        const val MSG_RESPONSE = 2
+        const val MSG_COOKIE = 3
+        const val MSG_TRANSPORT = 4
+
+        const val INITIATION_LEN = 148
+        const val RESPONSE_LEN = 92
+        const val COOKIE_LEN = 64
+        const val TRANSPORT_HEADER = 16
+
+        const val KEY_LEN = 32
+        const val TAG_LEN = 16
+        const val NONCE_LEN = 12
+        const val TIMESTAMP_LEN = 12
+        const val MAC1_LEN = 16
+        const val MAC2_LEN = 16
+
+        const val REKEY_AFTER_MESSAGES = 1_000_000L
+        const val REJECT_AFTER_MESSAGES = 1_000_000_000L
+        const val REKEY_TIMEOUT = 5 // seconds
+        const val REKEY_AFTER_TIME = 120 // seconds
+
+        private val CONSTRUCTION = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+        private val IDENTIFIER = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+
+        fun create(
+            privateKeyB64: String,
+            peerPublicKeyB64: String,
+            pskB64: String = ""
+        ): WireGuardNoise {
+            val privKey = decodeBase64(privateKeyB64)
+            val pubKey = publicFromPrivate(privKey)
+            val peerPub = decodeBase64(peerPublicKeyB64)
+            val psk = if (pskB64.isNotBlank()) decodeBase64(pskB64) else ByteArray(32)
+            return WireGuardNoise(privKey, pubKey, peerPub, psk)
+        }
+
+        fun decodeBase64(s: String): ByteArray = Base64.getDecoder().decode(s)
+        fun encodeBase64(b: ByteArray): String = Base64.getEncoder().encodeToString(b)
+
+        /**
+         * Derive public key from private key using X25519 basepoint multiplication.
+         */
+        fun publicFromPrivate(privateKey: ByteArray): ByteArray {
+            val basepoint = ByteArray(32) { if (it == 0) 9.toByte() else 0 }
+            val clamped = privateKey.copyOf()
+            clamped[0] = (clamped[0].toInt() and 0xF8).toByte()
+            clamped[31] = (clamped[31].toInt() and 0x7F).toByte()
+            clamped[31] = (clamped[31].toInt() or 0x40).toByte()
+            return WireGuardCrypto.sharedSecret(clamped, basepoint)
+        }
+    }
+
+    // ---- Handshake state ----
+
+    private var handshakeHash = ByteArray(KEY_LEN)
+    private var chainingKey = ByteArray(KEY_LEN)
+    private var ephemeralPrivate: ByteArray? = null
+    private var lastSentHandshake: Long = 0
+
+    data class TransportKeys(
+        val sendKey: ByteArray,
+        val recvKey: ByteArray,
+        var sendCounter: Long = 0,
+        var recvCounter: Long = 0
+    )
+
+    @Volatile
+    var transportKeys: TransportKeys? = null
+        private set
+
+    @Volatile
+    var handshakeComplete = false
+        private set
+
+    // ---- Initialization ----
+
+    init {
+        initializeHandshake(psk)
+    }
+
+    private fun initializeHandshake(psk: ByteArray) {
+        var ck = hashConstruction()
+        // hash = HASH(CONSTRUCTION || identifier)
+        var hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(ck, IDENTIFIER.toByteArray()))
+        // hash = HASH(hash || peer_static_public)
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, peerStaticPublicKey))
+
+        if (psk.any { it != 0.toByte() }) {
+            val (newCk, k) = noiseKdf(ck, psk)
+            ck = newCk
+            hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, k))
+        }
+
+        chainingKey = ck
+        handshakeHash = hash
+    }
+
+    private fun hashConstruction(): ByteArray {
+        // ck = HASH(CONSTRUCTION)
+        return WireGuardCrypto.blake2s(CONSTRUCTION.toByteArray())
+    }
+
+    // ---- Noise KDF (HMAC-BLAKE2s based, per Noise spec) ----
+
+    private fun noiseKdf(ck: ByteArray, ikm: ByteArray): Pair<ByteArray, ByteArray> {
+        val tempKey = WireGuardCrypto.hmacBlake2s(ck, ikm)
+        val k1 = WireGuardCrypto.hmacBlake2s(tempKey, byteArrayOf(0x01))
+        val k2 = WireGuardCrypto.hmacBlake2s(tempKey, byteArrayOf(0x02))
+        return Pair(k1, k2)
+    }
+
+    // ---- MAC1 / MAC2 computation ----
+
+    /**
+     * MAC1 per WireGuard spec:
+     *   mac1_key = BLAKE2s("mac1----" || peerStaticPublicKey)
+     *   MAC1 = BLAKE2s(key=mac1_key, msg)[:16]
+     */
+    private fun computeMac1(msg: ByteArray): ByteArray {
+        val label = "mac1----".toByteArray()
+        val mac1Key = WireGuardCrypto.blake2s(WireGuardCrypto.concat(label, peerStaticPublicKey))
+        return WireGuardCrypto.blake2s(msg, mac1Key)
+            .copyOf(MAC1_LEN)
+    }
+
+    // ---- Handshake: Create Initiation message (Type 1) ----
+
+    fun createInitiation(): ByteArray {
+        val (epPriv, epPub) = WireGuardCrypto.generateKeyPair()
+        ephemeralPrivate = epPriv
+
+        var hash = handshakeHash.copyOf()
+        var ck = chainingKey.copyOf()
+
+        // -> e
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, epPub))
+
+        // -> es
+        val (newCk1, kEs) = noiseKdf(ck, WireGuardCrypto.sharedSecret(epPriv, peerStaticPublicKey))
+        ck = newCk1
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kEs))
+
+        // -> s (encrypt static public key)
+        val encStatic = WireGuardCrypto.aeadEncrypt(kEs, zeroNonce(), staticPublicKey, hash)
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, encStatic))
+
+        // -> ss
+        val (newCk2, kSs) = noiseKdf(ck, WireGuardCrypto.sharedSecret(staticPrivateKey, peerStaticPublicKey))
+        ck = newCk2
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kSs))
+
+        // -> {t} (encrypt timestamp)
+        val timestamp = makeTimestamp()
+        val encTimestamp = WireGuardCrypto.aeadEncrypt(kSs, zeroNonce(), timestamp, hash)
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, encTimestamp))
+
+        // Save state for when response comes
+        handshakeHash = hash
+        chainingKey = ck
+
+        // Derive transport keys
+        val (sendKey, recvKey) = noiseKdf(ck, ByteArray(0))
+        transportKeys = TransportKeys(sendKey = sendKey, recvKey = recvKey)
+
+        lastSentHandshake = System.currentTimeMillis()
+
+        // Build message: type(4) | senderIdx(4) | epPub(32) | encStatic(48) | encTimestamp(28) | mac1(16) | mac2(16)
+        val senderIndex = generateSenderIndex()
+        val msgBody = WireGuardCrypto.concat(epPub, encStatic, encTimestamp)
+        val mac1Input = WireGuardCrypto.concat(intToLE(MSG_INITIATION), senderIndex, msgBody)
+        val mac1 = computeMac1(mac1Input)
+        val mac2 = ByteArray(MAC2_LEN) // No cookie
+
+        val message = WireGuardCrypto.concat(
+            intToLE(MSG_INITIATION),
+            senderIndex,
+            msgBody,
+            mac1,
+            mac2
+        )
+
+        Log.i(TAG, "Created Initiation: ${message.size} bytes, epPub=${epPub.toHex()}")
+        return message
+    }
+
+    // ---- Handshake: Process Response message (Type 2) ----
+
+    fun processResponse(data: ByteArray, offset: Int = 0): Boolean {
+        if (data.size - offset < RESPONSE_LEN) {
+            Log.e(TAG, "Response too short: ${data.size - offset} bytes")
+            return false
+        }
+
+        val msgType = data[offset].toInt() and 0xFF
+        if (msgType != MSG_RESPONSE) return false
+
+        // Response layout: type(4) | senderIdx(4) | receiverIdx(4) | epPub(32) | encEmpty(16) | mac1(16) | mac2(16)
+        val peerEpPub = data.copyOfRange(offset + 12, offset + 44)
+        val encEmpty = data.copyOfRange(offset + 44, offset + 60)
+
+        return finishResponderProcessing(peerEpPub, encEmpty)
+    }
+
+    /**
+     * Process a handshake Initiation from the peer (responder role).
+     * Returns the Response message (92 bytes) or null on failure.
+     */
+    fun processInitiation(data: ByteArray, offset: Int = 0): ByteArray? {
+        if (data.size - offset < INITIATION_LEN) {
+            Log.e(TAG, "Initiation too short: ${data.size - offset} bytes")
+            return null
+        }
+
+        // Initiation layout: type(4) | senderIdx(4) | epPub(32) | encStatic(48) | encTimestamp(28) | mac1(16) | mac2(16)
+        val senderIndex = data.copyOfRange(offset + 4, offset + 8)
+        val peerEpPub = data.copyOfRange(offset + 8, offset + 40)
+        val encStatic = data.copyOfRange(offset + 40, offset + 88)
+        val encTimestamp = data.copyOfRange(offset + 88, offset + 116)
+        val mac1 = data.copyOfRange(offset + 116, offset + 132)
+
+        // Verify MAC1
+        val msgBody = WireGuardCrypto.concat(peerEpPub, encStatic, encTimestamp)
+        val mac1Input = WireGuardCrypto.concat(intToLE(MSG_INITIATION), senderIndex, msgBody)
+        val expectedMac1 = computeMac1(mac1Input)
+        if (!WireGuardCrypto.constantEquals(mac1, expectedMac1)) {
+            Log.e(TAG, "MAC1 verification failed")
+            return null
+        }
+
+        // Initialize handshake state as responder
+        initializeHandshake(psk)
+
+        var hash = handshakeHash.copyOf()
+        var ck = chainingKey.copyOf()
+
+        // -> e (peer's ephemeral)
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, peerEpPub))
+
+        // -> es
+        val (newCk1, kEs) = noiseKdf(ck, WireGuardCrypto.sharedSecret(staticPrivateKey, peerEpPub))
+        ck = newCk1
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kEs))
+
+        // -> s (decrypt peer's static public key)
+        val peerStaticPub: ByteArray
+        try {
+            peerStaticPub = WireGuardCrypto.aeadDecrypt(kEs, zeroNonce(), encStatic, hash)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to decrypt peer static key", e)
+            return null
+        }
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, encStatic))
+
+        // -> ss
+        val (newCk2, kSs) = noiseKdf(ck, WireGuardCrypto.sharedSecret(staticPrivateKey, peerStaticPub))
+        ck = newCk2
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kSs))
+
+        // -> {t} (decrypt timestamp)
+        try {
+            WireGuardCrypto.aeadDecrypt(kSs, zeroNonce(), encTimestamp, hash)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to decrypt timestamp", e)
+            return null
+        }
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, encTimestamp))
+
+        // Now construct response
+        val (erPriv, erPub) = WireGuardCrypto.generateKeyPair()
+        ephemeralPrivate = erPriv
+
+        // -> e
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, erPub))
+
+        // -> ee
+        val (newCkEe, kEe) = noiseKdf(ck, WireGuardCrypto.sharedSecret(erPriv, peerEpPub))
+        ck = newCkEe
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kEe))
+
+        // -> se
+        val (newCkSe, kSe) = noiseKdf(ck, WireGuardCrypto.sharedSecret(erPriv, peerStaticPub))
+        ck = newCkSe
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kSe))
+
+        // -> psk
+        var kFinal = kSe
+        if (psk.any { it != 0.toByte() }) {
+            val (newCkPsk, kPsk) = noiseKdf(ck, psk)
+            ck = newCkPsk
+            hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kPsk))
+            kFinal = kPsk
+        }
+
+        // -> {}
+        val encEmpty = WireGuardCrypto.aeadEncrypt(kFinal, zeroNonce(), ByteArray(0), hash)
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, encEmpty))
+
+        handshakeHash = hash
+        chainingKey = ck
+
+        // Derive transport keys
+        val (sendKey, recvKey) = noiseKdf(ck, ByteArray(0))
+        // As responder: our send = their recv, our recv = their send
+        transportKeys = TransportKeys(sendKey = sendKey, recvKey = recvKey)
+        handshakeComplete = true
+
+        lastSentHandshake = System.currentTimeMillis()
+
+        // Build response message: type(4) | senderIdx(4) | receiverIdx(4) | epPub(32) | encEmpty(16) | mac1(16) | mac2(16)
+        val respSenderIndex = generateSenderIndex()
+        val respBody = WireGuardCrypto.concat(respSenderIndex, senderIndex, erPub, encEmpty)
+        val respMac1Input = WireGuardCrypto.concat(intToLE(MSG_RESPONSE), respBody)
+        val respMac1 = computeMac1(respMac1Input)
+        val respMac2 = ByteArray(MAC2_LEN)
+
+        val message = WireGuardCrypto.concat(
+            intToLE(MSG_RESPONSE),
+            respBody,
+            respMac1,
+            respMac2
+        )
+
+        Log.i(TAG, "Processed Initiation, created Response: ${message.size} bytes")
+        return message
+    }
+
+    private fun finishResponderProcessing(peerEpPub: ByteArray, encEmpty: ByteArray): Boolean {
+        if (ephemeralPrivate == null) {
+            Log.e(TAG, "No ephemeral private key — need to create initiation first")
+            return false
+        }
+
+        var hash = handshakeHash.copyOf()
+        var ck = chainingKey.copyOf()
+
+        // -> e (peer's ephemeral)
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, peerEpPub))
+
+        // -> ee
+        val (newCkEe, kEe) = noiseKdf(ck, WireGuardCrypto.sharedSecret(ephemeralPrivate!!, peerEpPub))
+        ck = newCkEe
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kEe))
+
+        // -> se
+        val (newCkSe, kSe) = noiseKdf(ck, WireGuardCrypto.sharedSecret(ephemeralPrivate!!, peerStaticPublicKey))
+        ck = newCkSe
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kSe))
+
+        // -> psk
+        var kFinal = kSe
+        if (psk.any { it != 0.toByte() }) {
+            val (newCkPsk, kPsk) = noiseKdf(ck, psk)
+            ck = newCkPsk
+            hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, kPsk))
+            kFinal = kPsk
+        }
+
+        // -> {} (decrypt empty aead to verify)
+        try {
+            WireGuardCrypto.aeadDecrypt(kFinal, zeroNonce(), encEmpty, hash)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to decrypt response AEAD", e)
+            return false
+        }
+        hash = WireGuardCrypto.blake2s(WireGuardCrypto.concat(hash, encEmpty))
+
+        handshakeHash = hash
+        chainingKey = ck
+
+        // Derive final transport keys: we're initiator
+        val (sendKey, recvKey) = noiseKdf(ck, ByteArray(0))
+        transportKeys = TransportKeys(sendKey = sendKey, recvKey = recvKey)
+        handshakeComplete = true
+
+        lastSentHandshake = System.currentTimeMillis()
+
+        Log.i(TAG, "Handshake complete! Response processed successfully")
+        return true
+    }
+
+    // ---- Transport: Encrypt ----
+
+    fun encryptTransport(plaintext: ByteArray, counter: Long): ByteArray {
+        val keys = transportKeys ?: throw IllegalStateException("Handshake not complete")
+        val nonce = makeTransportNonce(counter)
+        return WireGuardCrypto.aeadEncrypt(keys.sendKey, nonce, plaintext)
+    }
+
+    // ---- Transport: Decrypt ----
+
+    fun decryptTransport(data: ByteArray, offset: Int, counter: Long): ByteArray {
+        val keys = transportKeys ?: throw IllegalStateException("Handshake not complete")
+        val nonce = makeTransportNonce(counter)
+        return WireGuardCrypto.aeadDecrypt(keys.recvKey, nonce, data.copyOfRange(offset, data.size))
+    }
+
+    /**
+     * Parse a raw WireGuard message and return the type and relevant data.
+     */
+    data class WireGuardMessage(
+        val type: Int,
+        val receiverIndex: ByteArray,
+        val counter: Long,
+        val payload: ByteArray,
+        val rawData: ByteArray
+    )
+
+    fun parseMessage(data: ByteArray, offset: Int = 0): WireGuardMessage {
+        val type = data[offset].toInt() and 0xFF
+        val receiverIndex = data.copyOfRange(offset + 4, offset + 8)
+        val counter = if (type == MSG_TRANSPORT) {
+            readLE64(data, offset + 8)
+        } else 0L
+        val payload = data.copyOfRange(offset + TRANSPORT_HEADER, data.size)
+        return WireGuardMessage(type, receiverIndex, counter, payload, data)
+    }
+
+    // ---- Should re-handshake check ----
+
+    fun shouldRekey(): Boolean {
+        val keys = transportKeys ?: return false
+        val now = System.currentTimeMillis()
+        return keys.sendCounter >= REKEY_AFTER_MESSAGES ||
+            keys.recvCounter >= REKEY_AFTER_MESSAGES ||
+            now - lastSentHandshake > REKEY_AFTER_TIME * 1000
+    }
+
+    // ---- Utility ----
+
+    private fun zeroNonce(): ByteArray = ByteArray(NONCE_LEN)
+
+    private fun makeTransportNonce(counter: Long): ByteArray {
+        val nonce = ByteArray(NONCE_LEN)
+        writeLE64(nonce, 0, counter)
+        return nonce
+    }
+
+    private fun makeTimestamp(): ByteArray {
+        val ts = ByteArray(TIMESTAMP_LEN)
+        val secs = System.currentTimeMillis() / 1000
+        writeLE64(ts, 0, secs)
+        val nano = ((System.currentTimeMillis() % 1000) * 1_000_000).toInt()
+        writeLE32(ts, 8, nano)
+        return ts
+    }
+
+    private fun generateSenderIndex(): ByteArray {
+        val rng = java.security.SecureRandom()
+        val idx = ByteArray(4)
+        rng.nextBytes(idx)
+        return idx
+    }
+
+    private fun intToLE(v: Int): ByteArray {
+        val b = ByteArray(4)
+        writeLE32(b, 0, v)
+        return b
+    }
+
+    private fun writeLE32(buf: ByteArray, off: Int, v: Int) {
+        buf[off] = v.toByte()
+        buf[off + 1] = (v shr 8).toByte()
+        buf[off + 2] = (v shr 16).toByte()
+        buf[off + 3] = (v shr 24).toByte()
+    }
+
+    private fun writeLE64(buf: ByteArray, off: Int, v: Long) {
+        buf[off] = v.toByte()
+        buf[off + 1] = (v shr 8).toByte()
+        buf[off + 2] = (v shr 16).toByte()
+        buf[off + 3] = (v shr 24).toByte()
+        buf[off + 4] = (v shr 32).toByte()
+        buf[off + 5] = (v shr 40).toByte()
+        buf[off + 6] = (v shr 48).toByte()
+        buf[off + 7] = (v shr 56).toByte()
+    }
+
+    private fun readLE64(buf: ByteArray, off: Int): Long {
+        var v = 0L
+        for (i in 0 until 8) {
+            v = v or ((buf[off + i].toLong() and 0xFF) shl (i * 8))
+        }
+        return v
+    }
+}

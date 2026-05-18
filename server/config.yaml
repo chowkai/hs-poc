@@ -1,0 +1,49 @@
+---
+server_url: http://43.165.166.56:8080
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: true
+
+noise:
+  private_key_path: ./hs-data/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+derp:
+  server:
+    enabled: false
+  urls: []
+  paths: []
+  auto_update_enabled: false
+
+disable_check_updates: true
+
+database:
+  type: sqlite
+  debug: false
+  gorm:
+    prepare_stmt: true
+    parameterized_queries: true
+    skip_err_record_not_found: true
+    slow_threshold: 1000
+  sqlite:
+    path: ./hs-data/headscale.db
+    write_ahead_log: true
+    wal_autocheckpoint: 1000
+
+node:
+  default_expiry: 0
+
+dns:
+  magic_dns: false
+  base_domain: ""
+  override_local_dns: false
+  nameservers:
+    global: []
+    split: {}
+  search_domains: []
+  extra_records: []

@@ -1,0 +1,417 @@
+package com.example.hs_poc
+
+import android.util.Log
+import java.math.BigInteger
+import java.security.KeyFactory
+import java.security.SecureRandom
+import java.security.spec.PKCS8EncodedKeySpec
+import java.security.spec.X509EncodedKeySpec
+import javax.crypto.Cipher
+import javax.crypto.KeyAgreement
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import kotlin.experimental.and
+
+/**
+ * WireGuard-compatible cryptographic primitives using Android API 33+ XDH and javax.crypto.
+ */
+object WireGuardCrypto {
+
+    const val TAG = "WireGuardCrypto"
+    const val KEY_LEN = 32
+    const val TAG_LEN = 16
+    const val NONCE_LEN = 12
+    const val BLAKE2S_HASH_LEN = 32
+
+    // RFC 7748 X25519 constants
+    private val P = BigInteger("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFED", 16)
+    private val A24 = BigInteger("121666")  // (486662 - 2) / 4
+    private val X25519_BASEPOINT = byteArrayOf(
+        9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    )
+
+    // ---- X25519 Key Pair (RFC 7748, pure Kotlin, no JDK KeyPairGenerator) ----
+
+    fun generateKeyPair(): Pair<ByteArray, ByteArray> {
+        val random = SecureRandom()
+        val privateKey = ByteArray(KEY_LEN)
+        random.nextBytes(privateKey)
+        clampScalar(privateKey)
+        val publicKey = x25519(privateKey, X25519_BASEPOINT)
+        Log.i(TAG, "Generated X25519 key pair: pub=${publicKey.toHex()}")
+        return Pair(privateKey, publicKey)
+    }
+
+    /** Clamp scalar per RFC 7748 §5 */
+    private fun clampScalar(k: ByteArray) {
+        k[0] = (k[0].toInt() and 0xF8).toByte()
+        k[KEY_LEN - 1] = ((k[KEY_LEN - 1].toInt() and 0x7F) or 0x40).toByte()
+    }
+
+    /** RFC 7748 Montgomery ladder X25519(s, u) → x-coordinate */
+    private fun x25519(scalar: ByteArray, u: ByteArray): ByteArray {
+        val k = scalar.copyOf()
+        clampScalar(k)
+        val uBE = u.reversedArray()  // RFC 7748 decodes little-endian to big-endian integer
+
+        var x2 = BigInteger.ONE
+        var z2 = BigInteger.ZERO
+        var x3 = BigInteger(1, uBE)
+        val x1 = x3  // save original u-coordinate (RFC 7748: x_1 in §5)
+        var z3 = BigInteger.ONE
+        var swap = 0
+
+        for (t in 254 downTo 0) {
+            val kt = (k[t / 8].toInt() shr (t % 8)) and 1
+            swap = swap xor kt
+            if (swap == 1) {
+                var tx = x2; x2 = x3; x3 = tx
+                var tz = z2; z2 = z3; z3 = tz
+            }
+            swap = kt
+
+            val a = x2.add(z2).mod(P)
+            val aa = a.multiply(a).mod(P)
+            val b = x2.subtract(z2).add(P).mod(P)
+            val bb = b.multiply(b).mod(P)
+            val e = aa.subtract(bb).add(P).mod(P)
+            val c = x3.add(z3).mod(P)
+            val d = x3.subtract(z3).add(P).mod(P)
+            val da = d.multiply(a).mod(P)
+            val cb = c.multiply(b).mod(P)
+            x3 = da.add(cb).modPow(BigInteger.TWO, P)
+            z3 = x1.multiply(da.subtract(cb).add(P).modPow(BigInteger.TWO, P)).mod(P)
+            x2 = aa.multiply(bb).mod(P)
+            z2 = e.multiply(aa.add(A24.multiply(e).mod(P)).mod(P)).mod(P)
+        }
+
+        if (swap == 1) {
+            var tx = x2; x2 = x3; x3 = tx
+            var tz = z2; z2 = z3; z3 = tz
+        }
+
+        val inv = z2.modPow(P.subtract(BigInteger.TWO), P)
+        val valBig = x2.multiply(inv).mod(P)
+        return encodeUCoordinate(valBig)
+    }
+
+    /** Encode big-endian integer → 32-byte little-endian */
+    private fun encodeUCoordinate(v: BigInteger): ByteArray {
+        val raw = ByteArray(KEY_LEN)
+        val bytes = v.toByteArray()  // big-endian, minimal length
+        val start = if (bytes.size > KEY_LEN) bytes.size - KEY_LEN else 0
+        for (i in 0 until minOf(KEY_LEN, bytes.size - start)) {
+            raw[KEY_LEN - 1 - i] = bytes[start + i]
+        }
+        return raw
+    }
+
+    // ---- PKCS8 / X509 helpers (for sharedSecret which uses JDK XDH) ----
+
+    /**
+     * Parse DER-encoded X509 SubjectPublicKeyInfo to raw 32-byte X25519 key.
+     * The raw key is always the last 32 bytes of the encoded blob.
+     */
+    private fun parseX509PublicKey(encoded: ByteArray): ByteArray {
+        val raw = ByteArray(KEY_LEN)
+        System.arraycopy(encoded, encoded.size - KEY_LEN, raw, 0, KEY_LEN)
+        return raw
+    }
+
+    /**
+     * Parse DER-encoded PKCS#8 PrivateKeyInfo to raw 32-byte X25519 key.
+     * Structurally the last 32 bytes after the curve OID wrapping.
+     */
+    private fun parsePkcs8PrivateKey(encoded: ByteArray): ByteArray {
+        val raw = ByteArray(KEY_LEN)
+        System.arraycopy(encoded, encoded.size - KEY_LEN, raw, 0, KEY_LEN)
+        return raw
+    }
+
+    fun rawPublicToX509(rawKey: ByteArray): ByteArray {
+        // OID + wrapped raw key for X25519 SPKI
+        val prefix = byteArrayOf(
+            0x30.toByte(), 0x2A.toByte(), 0x30.toByte(), 0x05.toByte(), 0x06.toByte(),
+            0x03.toByte(), 0x2B.toByte(), 0x65.toByte(), 0x6E.toByte(), 0x03.toByte(),
+            0x21.toByte(), 0x00.toByte()
+        )
+        return prefix + rawKey
+    }
+
+    fun rawPrivateToPkcs8(rawKey: ByteArray): ByteArray {
+        val prefix = byteArrayOf(
+            0x30.toByte(), 0x2E.toByte(), 0x02.toByte(), 0x01.toByte(), 0x00.toByte(),
+            0x30.toByte(), 0x05.toByte(), 0x06.toByte(), 0x03.toByte(), 0x2B.toByte(),
+            0x65.toByte(), 0x6E.toByte(), 0x04.toByte(), 0x22.toByte(), 0x04.toByte(),
+            0x20.toByte()
+        )
+        return prefix + rawKey
+    }
+
+    // ---- X25519 DH ----
+
+    fun sharedSecret(privateKey: ByteArray, publicKey: ByteArray): ByteArray {
+        val kf = KeyFactory.getInstance("XDH")
+        val pubSpec = java.security.spec.X509EncodedKeySpec(rawPublicToX509(publicKey))
+        val pubKey = kf.generatePublic(pubSpec)
+
+        val privSpec = PKCS8EncodedKeySpec(rawPrivateToPkcs8(privateKey))
+        val privKey = kf.generatePrivate(privSpec)
+
+        val ka = KeyAgreement.getInstance("XDH")
+        ka.init(privKey)
+        ka.doPhase(pubKey, true)
+        val secret = ka.generateSecret()
+        Log.d(TAG, "DH shared secret: ${secret.toHex()}")
+        return secret
+    }
+
+    // ---- ChaCha20-Poly1305 ----
+
+    /**
+     * AEAD encrypt: plaintext -> ciphertext || 16-byte poly1305 tag.
+     * WireGuard format: ChaCha20-Poly1305 with 12-byte nonce and AD=empty.
+     */
+    fun aeadEncrypt(key: ByteArray, nonce: ByteArray, plaintext: ByteArray, aad: ByteArray = ByteArray(0)): ByteArray {
+        val cipher = Cipher.getInstance("ChaCha20-Poly1305")
+        val spec = javax.crypto.spec.IvParameterSpec(nonce)
+        val keySpec = SecretKeySpec(key, 0, key.size, "ChaCha20")
+        cipher.init(Cipher.ENCRYPT_MODE, keySpec, spec)
+        if (aad.isNotEmpty()) {
+            cipher.updateAAD(aad)
+        }
+        return cipher.doFinal(plaintext)
+    }
+
+    /**
+     * AEAD decrypt: ciphertext || 16-byte tag -> plaintext.
+     * Throws AEADBadTagException on authentication failure.
+     */
+    fun aeadDecrypt(key: ByteArray, nonce: ByteArray, ciphertext: ByteArray, aad: ByteArray = ByteArray(0)): ByteArray {
+        val cipher = Cipher.getInstance("ChaCha20-Poly1305")
+        val spec = javax.crypto.spec.IvParameterSpec(nonce)
+        val keySpec = SecretKeySpec(key, 0, key.size, "ChaCha20")
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, spec)
+        if (aad.isNotEmpty()) {
+            cipher.updateAAD(aad)
+        }
+        return cipher.doFinal(ciphertext)
+    }
+
+    // ---- HMAC-BLAKE2s (WireGuard uses BLAKE2s-based HMAC, not SHA-256) ----
+
+    /**
+     * HMAC using BLAKE2s as the underlying hash function.
+     * WireGuard's HKDF uses HMAC-BLAKE2s, not HMAC-SHA256.
+     */
+    fun hmacBlake2s(key: ByteArray, data: ByteArray): ByteArray {
+        val blockLen = 64 // BLAKE2s block size
+        val k = if (key.size > blockLen) blake2s(key) else key.copyOf()
+        val kPadded = ByteArray(blockLen)
+        System.arraycopy(k, 0, kPadded, 0, k.size)
+
+        val ipad = ByteArray(blockLen) { (kPadded[it].toInt() xor 0x36).toByte() }
+        val opad = ByteArray(blockLen) { (kPadded[it].toInt() xor 0x5C).toByte() }
+
+        val innerHash = blake2s(data, ipad)
+        return blake2s(innerHash, opad)
+    }
+
+    // ---- HKDF (RFC 5869) using HMAC-BLAKE2s ----
+
+    fun hkdfExtract(salt: ByteArray, ikm: ByteArray): ByteArray {
+        return hmacBlake2s(salt, ikm)
+    }
+
+    fun hkdfExpand(prk: ByteArray, info: ByteArray, length: Int): ByteArray {
+        val n = (length + 31) / 32
+        val blocks = ArrayList<ByteArray>(n)
+        var t = ByteArray(0)
+
+        for (i in 0 until n) {
+            val input = t + info + (i + 1).toByte()
+            t = hmacBlake2s(prk, input)
+            blocks.add(t)
+        }
+
+        val result = ByteArray(length)
+        var offset = 0
+        for (block in blocks) {
+            val toCopy = minOf(block.size, length - offset)
+            System.arraycopy(block, 0, result, offset, toCopy)
+            offset += toCopy
+        }
+        return result
+    }
+
+    /**
+     * BLAKE2s with 256-bit output and 32-byte key.
+     * Full implementation per RFC 7693.
+     */
+    fun blake2s(data: ByteArray, key: ByteArray = ByteArray(0)): ByteArray {
+        return Blake2s.hash(data, key)
+    }
+
+    /**
+     * Hash a WireGuard label like "mac1----" or "handshake" using BLAKE2s.
+     */
+    fun hashLabel(label: String): ByteArray {
+        val input = ByteArray(BLAKE2S_HASH_LEN)
+        label.toByteArray().copyInto(input, 0, 0, minOf(label.length, BLAKE2S_HASH_LEN))
+        return Blake2s.hash(input)
+    }
+
+    // ---- Utility ----
+
+    fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+    fun concat(vararg arrays: ByteArray): ByteArray {
+        val total = arrays.sumOf { it.size }
+        val result = ByteArray(total)
+        var offset = 0
+        for (a in arrays) {
+            System.arraycopy(a, 0, result, offset, a.size)
+            offset += a.size
+        }
+        return result
+    }
+
+    fun zeroPad(input: ByteArray, len: Int): ByteArray {
+        if (input.size >= len) return input
+        val padded = ByteArray(len)
+        System.arraycopy(input, 0, padded, 0, input.size)
+        return padded
+    }
+
+    /**
+     * Constant-time comparison for MAC verification.
+     */
+    fun constantEquals(a: ByteArray, b: ByteArray): Boolean {
+        if (a.size != b.size) return false
+        var result = 0
+        for (i in a.indices) {
+            result = result or (a[i].toInt() xor b[i].toInt())
+        }
+        return result == 0
+    }
+}
+
+/**
+ * Pure Kotlin BLAKE2s implementation per RFC 7693.
+ */
+private object Blake2s {
+
+    private val IV = intArrayOf(
+        0x6A09E667.toInt(), 0xBB67AE85.toInt(), 0x3C6EF372.toInt(), 0xA54FF53A.toInt(),
+        0x510E527F.toInt(), 0x9B05688C.toInt(), 0x1F83D9AB.toInt(), 0x5BE0CD19.toInt()
+    )
+
+    private val SIGMA = arrayOf(
+        intArrayOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+        intArrayOf(14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3),
+        intArrayOf(11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4),
+        intArrayOf(7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8),
+        intArrayOf(9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13),
+        intArrayOf(2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9),
+        intArrayOf(12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11),
+        intArrayOf(13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10),
+        intArrayOf(6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5),
+        intArrayOf(10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0),
+    )
+
+    fun hash(data: ByteArray, key: ByteArray = ByteArray(0)): ByteArray {
+        val outLen = 32
+        val keyLen = key.size
+        val blockLen = 64
+
+        val h = IV.copyOf()
+        h[0] = h[0] xor (0x01010000 xor (keyLen shl 8) xor outLen)
+
+        // In keyed mode (RFC 7693 §2.8): prepend key padded to blockLen (64 bytes)
+        val padded = if (keyLen > 0) {
+            val keyBlock = ByteArray(blockLen)
+            System.arraycopy(key, 0, keyBlock, 0, minOf(keyLen, blockLen))
+            keyBlock + data
+        } else {
+            data.copyOf()
+        }
+
+        val totalDataLen = keyLen + data.size  // keyed mode: key block is part of the message
+        val m = IntArray(16)
+        var bytesCompressed: Long = 0
+        val numBlocks = (padded.size + blockLen - 1) / blockLen
+
+        for (blockIdx in 0 until numBlocks) {
+            val blockStart = blockIdx * blockLen
+            val blockEnd = minOf(blockStart + blockLen, padded.size)
+            val blockSize = blockEnd - blockStart
+
+            bytesCompressed += blockSize
+
+            for (i in 0 until 16) m[i] = 0
+            for (i in 0 until blockSize) {
+                val pos = i / 4
+                val shift = (i % 4) * 8
+                m[pos] = m[pos] or ((padded[blockStart + i].toInt() and 0xFF) shl shift)
+            }
+
+            val f0 = if (blockIdx == numBlocks - 1) 0xFFFFFFFF.toInt() else 0
+            compress(h, m, bytesCompressed, 0, f0)
+        }
+
+        val out = ByteArray(outLen)
+        for (i in 0 until outLen) {
+            out[i] = (h[i / 4] ushr ((i % 4) * 8)).toByte()
+        }
+        return out
+    }
+
+    private fun compress(
+        h: IntArray,
+        m: IntArray,
+        t0: Long,
+        t1: Long,
+        f0: Int
+    ) {
+        var v0 = h[0]; var v1 = h[1]; var v2 = h[2]; var v3 = h[3]
+        var v4 = h[4]; var v5 = h[5]; var v6 = h[6]; var v7 = h[7]
+        var v8 = IV[0]; var v9 = IV[1]; var v10 = IV[2]; var v11 = IV[3]
+        var v12 = IV[4] xor t0.toInt(); var v13 = IV[5] xor (t0 ushr 32).toInt()
+        var v14 = IV[6] xor t1.toInt(); var v15 = IV[7] xor (t1 ushr 32).toInt()
+        v14 = v14 xor f0
+
+        for (r in 0 until 10) {
+            G(v0, v4, v8, v12, m[SIGMA[r][0]], m[SIGMA[r][1]]).let { v0 = it[0]; v4 = it[1]; v8 = it[2]; v12 = it[3] }
+            G(v1, v5, v9, v13, m[SIGMA[r][2]], m[SIGMA[r][3]]).let { v1 = it[0]; v5 = it[1]; v9 = it[2]; v13 = it[3] }
+            G(v2, v6, v10, v14, m[SIGMA[r][4]], m[SIGMA[r][5]]).let { v2 = it[0]; v6 = it[1]; v10 = it[2]; v14 = it[3] }
+            G(v3, v7, v11, v15, m[SIGMA[r][6]], m[SIGMA[r][7]]).let { v3 = it[0]; v7 = it[1]; v11 = it[2]; v15 = it[3] }
+            G(v0, v5, v10, v15, m[SIGMA[r][8]], m[SIGMA[r][9]]).let { v0 = it[0]; v5 = it[1]; v10 = it[2]; v15 = it[3] }
+            G(v1, v6, v11, v12, m[SIGMA[r][10]], m[SIGMA[r][11]]).let { v1 = it[0]; v6 = it[1]; v11 = it[2]; v12 = it[3] }
+            G(v2, v7, v8, v13, m[SIGMA[r][12]], m[SIGMA[r][13]]).let { v2 = it[0]; v7 = it[1]; v8 = it[2]; v13 = it[3] }
+            G(v3, v4, v9, v14, m[SIGMA[r][14]], m[SIGMA[r][15]]).let { v3 = it[0]; v4 = it[1]; v9 = it[2]; v14 = it[3] }
+        }
+
+        h[0] = h[0] xor (v0 xor v8)
+        h[1] = h[1] xor (v1 xor v9)
+        h[2] = h[2] xor (v2 xor v10)
+        h[3] = h[3] xor (v3 xor v11)
+        h[4] = h[4] xor (v4 xor v12)
+        h[5] = h[5] xor (v5 xor v13)
+        h[6] = h[6] xor (v6 xor v14)
+        h[7] = h[7] xor (v7 xor v15)
+    }
+
+    private fun G(a: Int, b: Int, c: Int, d: Int, x: Int, y: Int): IntArray {
+        var va = a; var vb = b; var vc = c; var vd = d
+        va = (va + vb + x)
+        vd = (vd xor va) ushr 16 or ((vd xor va) shl 16)
+        vc = (vc + vd)
+        vb = (vb xor vc) ushr 12 or ((vb xor vc) shl 20)
+        va = (va + vb + y)
+        vd = (vd xor va) ushr 8 or ((vd xor va) shl 24)
+        vc = (vc + vd)
+        vb = (vb xor vc) ushr 7 or ((vb xor vc) shl 25)
+        return intArrayOf(va, vb, vc, vd)
+    }
+}

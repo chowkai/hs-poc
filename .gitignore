@@ -1,0 +1,68 @@
+# Build output
+build/
+build.old/
+.flutter-plugins*
+.dart_tool/
+.metadata
+*.pyc
+*.class
+*.dex
+*.jar
+*.apk
+*.aab
+*.db
+*.db-shm
+*.db-wal
+*.o
+*.so
+*.exe
+*.dll
+*.bin
+*.zip
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.history
+
+# Binary files
+client/hs-client
+client/hs-client-*
+flutter/assets/hs-client-linux
+flutter/assets/hs-client.exe
+server/headscale-bin
+server/hs-server
+tools/*/udp-*
+*.out
+
+# Database & secrets
+hs-data/*.db*
+hs-data/admin-key.txt
+
+# Platform ephemeral
+flutter/ios/Pods/
+flutter/ios/Flutter/Generated.xcconfig
+flutter/macos/Pods/
+flutter/macos/Flutter/ephemeral/
+flutter/linux/flutter/ephemeral/
+flutter/windows/flutter/ephemeral/
+
+# Gradle
+.gradle/
+local.properties
+android/.gradle/
+android/local.properties
+flutter/android/.gradle/
+flutter/android/local.properties
+flutter/android/build/
+flutter/android/app/build/
+flutter/android/build_stderr.txt
+flutter/android/.kotlin/
+android/build/
+android/app/build/
+android/.kotlin/
+
+# OS
+.DS_Store
+Thumbs.db
